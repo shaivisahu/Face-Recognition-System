@@ -1,4 +1,5 @@
-#!/usr/bin/env python3"""Create distributable zip package for the project."""
+#!/usr/bin/env python3
+"""Create distributable zip package for the project."""
 
 from pathlib import Path
 import zipfile
@@ -10,6 +11,7 @@ DEFAULT_FILES = [
     "README.md",
     "requirements.txt",
     "package_project.py",
+    "web_interface.py",
 ]
 
 
