@@ -1,24 +1,22 @@
 """
 Face Recognition — Simple Streamlit App
-Run with:  streamlit run web_interface.py
+Run with:  python -m streamlit run web_interface.py
 """
 
+import shutil
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
+import pandas as pd
 import streamlit as st
 from PIL import Image
 
 from face_recognition_system import TrainableFaceRecognizer
 
-# ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Face Recognition",
-    page_icon="🎭",
-    layout="centered",
-)
+# ── Page config ─────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Face Recognition", page_icon="🎭", layout="centered")
 
 st.markdown("""
 <style>
@@ -30,19 +28,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Constants ───────────────────────────────────────────────────────────────────
-DATA_DIR        = Path("webcam_training_data")
-SAMPLES_DIR     = DATA_DIR / "persons"
-TARGET_SAMPLES  = 30   # photos per person
+# ── Constants ────────────────────────────────────────────────────────────────────
+DATA_DIR       = Path("webcam_training_data")
+SAMPLES_DIR    = DATA_DIR / "persons"
+TARGET_SAMPLES = 50   # more samples = better accuracy
 
-# ── Session state defaults ──────────────────────────────────────────────────────
+# ── Session state ────────────────────────────────────────────────────────────────
 def _init():
     defaults = {
-        "page":            "home",   # home | capture | train | recognize
-        "person_name":     "",
-        "captured_count":  0,
-        "model_trained":   False,
-        "recognizer":      None,
+        "page":           "home",
+        "person_name":    "",
+        "model_trained":  False,
+        "recognizer":     None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -50,17 +47,29 @@ def _init():
 
 _init()
 
-# ── Helpers ─────────────────────────────────────────────────────────────────────
-def get_recognizer() -> TrainableFaceRecognizer:
-    if st.session_state.recognizer is None:
+# ── Helpers ──────────────────────────────────────────────────────────────────────
+def get_recognizer(force_new: bool = False) -> TrainableFaceRecognizer:
+    """Return cached recognizer. Pass force_new=True to discard old model."""
+    if force_new or st.session_state.recognizer is None:
         st.session_state.recognizer = TrainableFaceRecognizer(
             model_type="lbph",
             data_dir=str(DATA_DIR),
             unknown_threshold=55.0,
         )
-        if st.session_state.recognizer.is_trained:
-            st.session_state.model_trained = True
+        st.session_state.model_trained = st.session_state.recognizer.is_trained
     return st.session_state.recognizer
+
+
+def delete_old_model():
+    """Wipe saved model files so training always starts fresh."""
+    for fname in ["lbph_model.yml", "eigenfaces_model.yml", "fisherfaces_model.yml",
+                  "labels.pkl", "training_metadata.json"]:
+        f = DATA_DIR / fname
+        if f.exists():
+            f.unlink()
+    # Also clear cached recognizer
+    st.session_state.recognizer  = None
+    st.session_state.model_trained = False
 
 
 def detect_faces(gray: np.ndarray, recognizer: TrainableFaceRecognizer):
@@ -76,28 +85,67 @@ def annotate_frame(frame: np.ndarray, recognizer: TrainableFaceRecognizer) -> np
         name, conf = recognizer.predict(gray[y:y+h, x:x+w])
         color = (0, 200, 80) if name != "Unknown" else (30, 60, 220)
         cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-        cv2.rectangle(frame, (x, y-26), (x+w, y), color, -1)
+        cv2.rectangle(frame, (x, y-28), (x+w, y), color, -1)
         cv2.putText(frame, f"{name}  {conf:.0f}%",
-                    (x+4, y-7), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+                    (x+4, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
     return frame
 
 
-def save_face_crop(frame_bgr: np.ndarray, person_dir: Path) -> bool:
-    """Detect first face, save grayscale crop. Returns True on success."""
+def augment_and_save(gray_crop: np.ndarray, person_dir: Path):
+    """
+    Save the original crop + several augmented versions.
+    More variety = better accuracy without needing 100s of manual photos.
+    """
+    base_idx = len(list(person_dir.glob("*.jpg")))
+    crops = [gray_crop]
+
+    # Horizontal flip
+    crops.append(cv2.flip(gray_crop, 1))
+
+    # Brightness variations
+    for alpha in (0.75, 1.25):
+        crops.append(np.clip(gray_crop * alpha, 0, 255).astype(np.uint8))
+
+    # Slight blur (simulates out-of-focus)
+    crops.append(cv2.GaussianBlur(gray_crop, (3, 3), 0))
+
+    # Small rotation (+8° and -8°)
+    h, w = gray_crop.shape
+    cx, cy = w // 2, h // 2
+    for angle in (8, -8):
+        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+        crops.append(cv2.warpAffine(gray_crop, M, (w, h)))
+
+    for i, crop in enumerate(crops):
+        cv2.imwrite(str(person_dir / f"{base_idx + i:04d}.jpg"), crop)
+
+    return len(crops)  # number of images saved
+
+
+def save_face_crop(frame_bgr: np.ndarray, person_dir: Path):
+    """
+    Detect face in frame, apply augmentation, save all crops.
+    Returns (success: bool, n_saved: int).
+    """
     recognizer = get_recognizer()
     gray  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     faces = detect_faces(gray, recognizer)
     if len(faces) == 0:
-        return False
+        return False, 0
     x, y, w, h = faces[0]
-    crop = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
-    idx  = len(list(person_dir.glob("*.jpg")))
-    cv2.imwrite(str(person_dir / f"{idx:04d}.jpg"), crop)
-    return True
+    crop   = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+    n_saved = augment_and_save(crop, person_dir)
+    return True, n_saved
 
 
 def pil_to_bgr(pil_img) -> np.ndarray:
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def person_count() -> list:
+    if not SAMPLES_DIR.exists():
+        return []
+    return [p.name for p in sorted(SAMPLES_DIR.iterdir()) if p.is_dir()]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -105,21 +153,19 @@ def pil_to_bgr(pil_img) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════════════
 def page_home():
     st.title("🎭 Face Recognition")
-    st.caption("Capture your face from webcam · Train the model · Recognize in real time")
+    st.caption("Capture · Train · Recognize")
     st.markdown("---")
 
     recognizer = get_recognizer()
-
-    persons    = [p.name for p in SAMPLES_DIR.iterdir() if p.is_dir()] if SAMPLES_DIR.exists() else []
+    persons    = person_count()
     total_imgs = sum(len(list((SAMPLES_DIR / p).glob("*.jpg"))) for p in persons) if persons else 0
 
     col_a, col_b, col_c = st.columns(3)
-    col_a.metric("People registered", len(persons))
-    col_b.metric("Training images",   total_imgs)
+    col_a.metric("People", len(persons))
+    col_b.metric("Training images", total_imgs)
     col_c.metric("Model", "✅ Ready" if recognizer.is_trained else "⚠️ Not trained")
 
     st.markdown("---")
-    st.subheader("What would you like to do?")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -128,22 +174,29 @@ def page_home():
             st.rerun()
     with c2:
         label = "🔄  Re-train" if recognizer.is_trained else "🧠  Train model"
-        if st.button(label, use_container_width=True, disabled=(len(persons) == 0)):
+        if st.button(label, use_container_width=True, disabled=len(persons) == 0):
             st.session_state.page = "train"
             st.rerun()
     with c3:
-        if st.button("🎥  Live recognize", use_container_width=True,
-                     disabled=(not recognizer.is_trained)):
+        if st.button("🎥  Recognize", use_container_width=True,
+                     disabled=not recognizer.is_trained):
             st.session_state.page = "recognize"
             st.rerun()
 
+    # Registered people with manage option
     if persons:
         st.markdown("---")
         st.subheader("Registered people")
-        cols = st.columns(min(len(persons), 5))
-        for i, name in enumerate(sorted(persons)):
+        for name in persons:
             n = len(list((SAMPLES_DIR / name).glob("*.jpg")))
-            cols[i % 5].markdown(f"**{name}**\n\n`{n} photos`")
+            col_n, col_d = st.columns([4, 1])
+            icon = "🟢" if n >= 40 else ("🟡" if n >= 20 else "🔴")
+            col_n.markdown(f"{icon} **{name}** — {n} images")
+            if col_d.button("🗑 Delete", key=f"del_{name}"):
+                shutil.rmtree(SAMPLES_DIR / name)
+                st.success(f"Deleted {name}. Re-train for changes to take effect.")
+                delete_old_model()
+                st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -154,20 +207,19 @@ def page_capture():
 
     if st.button("← Back"):
         st.session_state.page = "home"
-        st.session_state.captured_count = 0
         st.rerun()
 
     st.markdown("---")
+    st.info(f"Each photo you take is saved as **7 augmented versions** automatically, "
+            f"so {TARGET_SAMPLES // 7} photos ≈ {TARGET_SAMPLES}+ training images.")
 
-    # Name input
     name_input = st.text_input(
         "Person's name",
         value=st.session_state.person_name,
         placeholder="e.g. Alice",
     )
     if name_input != st.session_state.person_name:
-        st.session_state.person_name     = name_input
-        st.session_state.captured_count  = 0
+        st.session_state.person_name = name_input
 
     if not name_input.strip():
         st.info("Enter a name above to get started.")
@@ -178,38 +230,50 @@ def page_capture():
     person_dir.mkdir(parents=True, exist_ok=True)
     existing   = len(list(person_dir.glob("*.jpg")))
 
-    # Progress
-    st.progress(min(existing / TARGET_SAMPLES, 1.0),
-                text=f"{existing} / {TARGET_SAMPLES} samples captured")
+    # ── Progress ─────────────────────────────────────────────────────────────
+    progress = min(existing / TARGET_SAMPLES, 1.0)
+    st.progress(progress, text=f"{existing} / {TARGET_SAMPLES} training images")
+
+    # Option to wipe and restart this person
+    col_cam, col_reset = st.columns([3, 1])
+    with col_reset:
+        if st.button("🗑 Clear & restart", help="Delete all photos for this person and start over"):
+            shutil.rmtree(person_dir)
+            person_dir.mkdir(parents=True, exist_ok=True)
+            delete_old_model()
+            st.success("Cleared. Start capturing again.")
+            st.rerun()
 
     if existing >= TARGET_SAMPLES:
-        st.success(f"✅  {TARGET_SAMPLES} samples captured for **{name}**!")
+        st.success(f"✅  Enough samples for **{name}**! You can now train.")
         if st.button("Go to Train →"):
             st.session_state.page = "train"
             st.rerun()
         return
 
-    st.markdown("**Look at the camera, then click the shutter button below.**")
+    with col_cam:
+        st.markdown("**Look at the camera and click the shutter. Vary your angle slightly each shot.**")
 
-    # key changes after each capture so the widget resets
     camera_frame = st.camera_input("Take a photo", key=f"cam_{existing}")
 
     if camera_frame is not None:
         frame_bgr = pil_to_bgr(Image.open(camera_frame))
-        if save_face_crop(frame_bgr, person_dir):
-            st.session_state.captured_count = existing + 1
-            st.success(f"✅  Saved! ({existing + 1}/{TARGET_SAMPLES})")
-            time.sleep(0.25)
+        found, n_saved = save_face_crop(frame_bgr, person_dir)
+        if found:
+            new_total = existing + n_saved
+            st.success(f"✅  Saved {n_saved} images (1 photo + augmentations) — total: {new_total}")
+            time.sleep(0.3)
             st.rerun()
         else:
-            st.warning("⚠️  No face detected. Move closer or improve lighting.")
+            st.warning("⚠️  No face detected. Move closer, face the camera, and try again.")
 
-    with st.expander("Tips for better accuracy"):
+    with st.expander("Tips for best accuracy"):
         st.markdown("""
-- Look straight at the camera for some shots, then tilt slightly left/right/up/down
-- Try different lighting conditions if possible
-- Avoid sunglasses or heavy shadows across your face
-- Aim for at least 20 clear photos
+- **Vary your angle** — straight on, slightly left, slightly right, chin up/down
+- **Vary lighting** — try near a window, then away from it
+- **Different expressions** — neutral, slight smile, serious
+- **No sunglasses or heavy shadows** across your eyes/face
+- Aim for **at least 8–10 good photos** (= 56–70 training images after augmentation)
         """)
 
 
@@ -225,46 +289,58 @@ def page_train():
 
     st.markdown("---")
 
-    if not SAMPLES_DIR.exists():
+    persons = person_count()
+    if not persons:
         st.error("No training data found. Capture some faces first.")
         return
 
-    persons = [p.name for p in SAMPLES_DIR.iterdir() if p.is_dir()]
-    if not persons:
-        st.error("No person folders found. Go capture faces first.")
-        return
-
-    # Summary
+    # Data summary
     st.subheader("Training data")
     total = 0
-    for person in sorted(persons):
+    low_count = False
+    for person in persons:
         n = len(list((SAMPLES_DIR / person).glob("*.jpg")))
         total += n
-        icon = "🟢" if n >= 20 else ("🟡" if n >= 10 else "🔴")
-        st.markdown(f"{icon} **{person}** — {n} photos")
-    st.markdown(f"**Total: {total} images · {len(persons)} people**")
+        icon = "🟢" if n >= 40 else ("🟡" if n >= 20 else "🔴")
+        if n < 20:
+            low_count = True
+        st.markdown(f"{icon} **{person}** — {n} images")
 
-    if any(len(list((SAMPLES_DIR / p).glob("*.jpg"))) < 5 for p in persons):
-        st.warning("⚠️  Some people have fewer than 5 photos — accuracy may suffer.")
+    st.markdown(f"**Total: {total} images across {len(persons)} people**")
+
+    if low_count:
+        st.warning("⚠️  Some people have fewer than 20 images. Capture more photos for better accuracy.")
 
     st.markdown("---")
 
+    # Settings
     col1, col2 = st.columns(2)
-    model_type = col1.selectbox("Model", ["lbph", "eigenfaces", "fisherfaces"])
+    model_type = col1.selectbox("Model type", ["lbph", "eigenfaces", "fisherfaces"],
+                                 help="LBPH works best for small datasets")
     val_split  = col2.slider("Validation split", 0.0, 0.4, 0.2, 0.05)
     threshold  = st.slider("Unknown threshold (%)", 0, 100, 55,
-                            help="Faces below this confidence score are labelled 'Unknown'")
+                            help="Predictions below this % are shown as Unknown")
+
+    st.markdown("---")
+
+    # Always wipe old model before training so it truly retrains from scratch
+    st.caption("ℹ️  Clicking Train will **delete the old model** and build a fresh one from your current photos.")
 
     if st.button("🚀  Start Training", type="primary"):
-        # Fresh recognizer with chosen settings
-        st.session_state.recognizer = TrainableFaceRecognizer(
+
+        # 1. Delete old saved model files
+        delete_old_model()
+
+        # 2. Create fresh recognizer (no model loaded from disk)
+        recognizer = TrainableFaceRecognizer(
             model_type=model_type,
             data_dir=str(DATA_DIR),
             unknown_threshold=float(threshold),
         )
-        recognizer = st.session_state.recognizer
+        st.session_state.recognizer = recognizer
 
-        with st.spinner("Training… this usually takes a few seconds."):
+        # 3. Train
+        with st.spinner("Training… please wait."):
             try:
                 meta = recognizer.train_model(
                     dataset_path=str(SAMPLES_DIR),
@@ -276,7 +352,7 @@ def page_train():
                 st.error(f"Training failed: {exc}")
                 return
 
-        st.success("✅  Model trained successfully!")
+        st.success("✅  Model trained and saved!")
         st.markdown("---")
 
         c1, c2, c3 = st.columns(3)
@@ -307,13 +383,12 @@ def page_recognize():
 
     st.caption(
         f"Model: **{recognizer.model_type.upper()}**  ·  "
-        f"Classes: **{len(recognizer.label_to_name)}**  ·  "
+        f"People: **{len(recognizer.label_to_name)}**  ·  "
         f"Threshold: **{recognizer.unknown_threshold:.0f}%**"
     )
     st.markdown("---")
 
-    mode = st.radio("Mode", ["📸 Single snapshot", "🔴 Continuous webcam"],
-                    horizontal=True)
+    mode = st.radio("Mode", ["📸 Single snapshot", "🔴 Continuous webcam"], horizontal=True)
 
     frame_slot  = st.empty()
     result_slot = st.empty()
@@ -323,8 +398,8 @@ def page_recognize():
         camera_frame = st.camera_input("Take a snapshot", key="recog_snap")
 
         if camera_frame is not None:
-            frame_bgr     = pil_to_bgr(Image.open(camera_frame))
-            annotated     = annotate_frame(frame_bgr.copy(), recognizer)
+            frame_bgr = pil_to_bgr(Image.open(camera_frame))
+            annotated = annotate_frame(frame_bgr.copy(), recognizer)
             frame_slot.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
                              use_container_width=True)
 
@@ -332,9 +407,8 @@ def page_recognize():
             faces = detect_faces(gray, recognizer)
 
             if len(faces) == 0:
-                result_slot.info("No faces detected in this snapshot.")
+                result_slot.info("No faces detected.")
             else:
-                import pandas as pd
                 rows = []
                 for (x, y, w, h) in faces:
                     name, conf = recognizer.predict(gray[y:y+h, x:x+w])
@@ -348,16 +422,15 @@ def page_recognize():
 
     # ── Continuous webcam ──────────────────────────────────────────────────────
     else:
-        st.info("Opens your webcam and recognizes faces continuously. Click **Stop** to end.")
+        st.info("Streams your webcam with live face recognition. Click **Stop** to end.")
         stop_btn = st.button("⏹  Stop")
 
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            st.error("Could not open webcam — make sure it is connected and not in use by another app.")
+            st.error("Could not open webcam. Make sure it is connected and not used by another app.")
             return
 
         try:
-            import pandas as pd
             while not stop_btn:
                 ret, frame = cap.read()
                 if not ret:
@@ -384,15 +457,12 @@ def page_recognize():
                 else:
                     result_slot.caption("No faces in frame")
 
-                time.sleep(0.04)   # ~25 fps
-
+                time.sleep(0.04)
         finally:
             cap.release()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ROUTER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Router ───────────────────────────────────────────────────────────────────────
 {
     "home":      page_home,
     "capture":   page_capture,
